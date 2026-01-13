@@ -1,0 +1,11 @@
+# 1. 测试传统数学算法
+python test.py --model srad
+python test.py --model ibf
+python test.py --model bm3d_us
+
+# 2. 测试深度学习基准
+python test.py --model dunet
+python test.py --model swin_us
+
+# 3. 测试提出的模型
+python test.py --model da_gated_ae
