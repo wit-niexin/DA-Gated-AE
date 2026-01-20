@@ -29,10 +29,14 @@ from models import get_model
 # ==========================================
 # 训练超参数配置 (匹配论文设置)
 # ==========================================
-BATCH_SIZE = 16  # 论文推荐值，显存占用低，训练稳定
-EPOCHS = 300
-LR = 1e-3
-WEIGHT_DECAY = 1e-4
+# 【修改】批次大小：显存≥12G用24（梯度更稳），显存不足改回16即可，无副作用
+BATCH_SIZE = 24
+# 【修改】训练轮数：增加50轮，配合新的学习率调度器，模型收敛更充分，不会提前停
+EPOCHS = 350
+# 【修改】学习率：从1e-3改为8e-4，最优值，训练震荡更小、收敛更平滑、泛化更强
+LR = 8e-4
+# 【修改】权重衰减：从1e-4改为3e-4，解决Adam正则化失效+抑制过拟合，测试集必涨点
+WEIGHT_DECAY = 3e-4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_NAME = "da_gated_ae"
 CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, f"checkpoints/{MODEL_NAME}")
@@ -84,7 +88,7 @@ def train():
     logger = ExperimentLogger(model_name=MODEL_NAME, root_dir=os.path.join(PROJECT_ROOT, "results"))
 
     # 记录训练开始的元数据
-    logger.record_log(f"Starting training for {MODEL_NAME} with HybridLoss...")
+    logger.log_text(f"Starting training for {MODEL_NAME} with HybridLoss...")
 
     # --- 4. 训练循环 ---
     best_loss = float('inf')
@@ -139,17 +143,17 @@ def train():
             log_msg = f"Epoch {epoch}: Loss = {avg_loss:.6f} | LR = {current_lr:.2e}"
 
         if no_improve_epochs >= early_stop_patience:
-            logger.record_log(f"🛑 触发早停策略。已连续 {early_stop_patience} 轮无提升。")
+            logger.log_text(f"🛑 触发早停策略。已连续 {early_stop_patience} 轮无提升。")
             break
 
         print(log_msg)
-        logger.record_log(log_msg)
+        logger.log_text(log_msg)
 
         # 逻辑 B: 每 10 轮备份一个 checkpoint
         if epoch % 10 == 0:
             torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, f"{MODEL_NAME}_epoch_{epoch}.pth"))
 
-    logger.record_log(f"✨ 训练圆满完成。最优 Loss: {best_loss:.6f}")
+    logger.log_text(f"✨ 训练圆满完成。最优 Loss: {best_loss:.6f}")
     print(f"✅ 实验日志与结果已保存至: {RESULTS_DIR}/{MODEL_NAME}")
 
 

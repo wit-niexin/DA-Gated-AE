@@ -1,67 +1,60 @@
 """
-Module: Noise Factory
-Description:
-    该模块是整个项目的“噪声生成中枢”。它统一了散斑噪声（Speckle Noise）的生成算法，
-    确保预处理阶段（Numpy）与模型训练阶段（Tensor）使用完全一致的物理模型。
-    这保证了实验的可复现性与论文描述的严谨对齐。
+Module: Noise Factory (采用 Correlated Noise 定义)
 """
 
 import torch
+import torch.nn.functional as F
 import numpy as np
+import cv2
 
 
 class SpeckleNoiseFactory:
     """
-    散斑噪声工厂类
-
-    物理背景：
-    超声图像中的散斑噪声通常被建模为“乘性噪声”。与常见的加性高斯噪声不同，
-    散斑噪声的强度与信号本身的幅值成正比，这模拟了超声波相干干扰的成像特性。
+    散斑噪声工厂类 - 增强版（包含空间相关性卷积）
     """
 
     @staticmethod
     def add_speckle_noise(img, sigma_sq):
         """
-        根据论文公式实现乘性散斑噪声: Y = X + X * N
-
-        参数说明:
-            img: 输入图像，支持两种格式：
-                 1. Numpy Array (H, W) - 用于离线数据预处理
-                 2. PyTorch Tensor (C, H, W) - 用于在线训练数据增强
-            sigma_sq: 噪声方差 (论文中定义的 σ²)，控制噪声的严重程度。
-                      常见取值：0.001 (轻微), 0.02 (中等), 0.5 (严重)。
-
-        返回:
-            与输入类型一致的含噪图像。
+        合成模型：
+        1. Noise Correlation: N_corr = N_raw * h (3x3 Mean Filter)
+        2. Image Synthesis: X = Y + Y * N_corr
         """
 
-        # --- 场景 A：处理 Numpy 格式 (可用于 step2_prepare_dataset.py) ---
+        # --- 场景 A：处理 Numpy 格式 (离线预处理) ---
         if isinstance(img, np.ndarray):
-            # 1. 归一化：将 0-255 的整数转换为 0-1 的浮点数进行数学运算
-            image_f = img.astype(np.float32) / 255.0
+            image_f: np.ndarray = img.astype(np.float32) / 255.0
 
-            # 2. 生成噪声 N：均值为 0，方差为 sigma_sq 的高斯分布
-            # 注意：np.random.normal 的第二个参数是标准差，即 sqrt(sigma_sq)
-            noise = np.random.normal(0, np.sqrt(sigma_sq), image_f.shape)
+            # Step 1: 生成原始噪声 N_raw
+            # 均值为 0, 方差为 sigma_sq
+            n_raw = np.random.normal(0, np.sqrt(sigma_sq), image_f.shape).astype(np.float32)
 
-            # 3. 乘性合成：Y = X + X * N
-            noisy = image_f + image_f * noise
+            # Step 2: 卷积产生相关性 (3x3 Mean Filtering Kernel)
+            # cv2.blur 实现了与均值核卷积的等效操作
+            n_corr = cv2.blur(n_raw, (3, 3))
 
-            # 4. 后处理：裁剪 [0, 1] 范围防止溢出，并恢复至 8-bit (0-255) 整数格式
+            # Step 3: 乘性合成 X = Y + Y * N_corr
+            noisy = image_f + image_f * n_corr
+
             return np.uint8(np.clip(noisy, 0, 1) * 255)
 
-        # --- 场景 B：处理 PyTorch Tensor 格式 (用于训练时的在线增强) ---
+        # --- 场景 B：处理 PyTorch Tensor 格式 (在线训练) ---
         elif torch.is_tensor(img):
-            # 1. 噪声生成：torch.randn_like 在 GPU 上生成与原图尺寸一致的正态分布随机数
-            # 乘以 sqrt(sigma_sq) 调整其方差
-            noise = torch.randn_like(img) * np.sqrt(sigma_sq)
+            # Step 1: 生成原始噪声 N_raw
+            n_raw = torch.randn_like(img) * np.sqrt(sigma_sq)
 
-            # 2. 乘性合成：利用张量广播并行计算
-            # 对应公式：含噪像素 = 原始像素 + 原始像素 * 噪声
-            noisy = img + img * noise
+            # Step 2: 卷积产生相关性 (使用 3x3 均值池化模拟卷积核 h)
+            # padding=1 保证输出尺寸不变，stride=1 保证逐像素平滑
+            if img.dim() == 3:  # (C, H, W)
+                n_raw_4d = n_raw.unsqueeze(0)
+                n_corr_4d = F.avg_pool2d(n_raw_4d, kernel_size=3, stride=1, padding=1)
+                n_corr = n_corr_4d.squeeze(0)
+            else:  # (B, C, H, W)
+                n_corr = F.avg_pool2d(n_raw, kernel_size=3, stride=1, padding=1)
 
-            # 3. 约束范围：将值限制在 [0.0, 1.0] 之间，保持数据分布稳定
+            # Step 3: 乘性合成
+            noisy = img + img * n_corr
+
             return torch.clamp(noisy, 0, 1)
 
-        # 如果类型不匹配，原样返回
         return img

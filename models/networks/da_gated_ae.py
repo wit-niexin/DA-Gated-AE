@@ -142,13 +142,13 @@ class DAGatedAE(nn.Module):
         self.gate3 = DAGate(base_feat * 4)
 
         # --- Step 3: Decoding ---
-        self.up3 = nn.UpsampleBlock(base_feat * 8, base_feat * 4)
+        self.up3 = UpsampleBlock(base_feat * 8, base_feat * 4)
         self.dec3 = self._make_dsc_layer(base_feat * 8, base_feat * 4)  # base*4(up) + base*4(gate)
 
-        self.up2 = nn.UpsampleBlock(base_feat * 4, base_feat * 2)
+        self.up2 = UpsampleBlock(base_feat * 4, base_feat * 2)
         self.dec2 = self._make_dsc_layer(base_feat * 4, base_feat * 2)
 
-        self.up1 = nn.UpsampleBlock(base_feat * 2, base_feat)
+        self.up1 = UpsampleBlock(base_feat * 2, base_feat)
         self.dec1 = self._make_dsc_layer(base_feat * 2, base_feat)
 
         self.final_conv = nn.Conv2d(base_feat, out_channels, kernel_size=1)

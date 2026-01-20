@@ -1,18 +1,7 @@
 """
-Module: Evaluation - Swin-US (Transformer-based Baseline)
-Description:
-    该脚本对 Swin-US 模型进行深度评估。
-    Swin-US 利用移动窗口自注意力机制捕捉超声图像的长程依赖，
-    但在推理速度和显存占用上通常高于 CNN 架构。
-
-Research Rationale:
-    1. 性能对标: 验证全局上下文建模对超声解剖结构（如卵泡边缘）的保护能力。
-    2. 效率对标: 通过统计 FPS 和推理耗时，量化 Transformer 部署在便携设备上的挑战。
+Module: Evaluation - US-DRUNet
 """
 
-import torch
-torch.cuda.empty_cache()
-torch.cuda.set_per_process_memory_fraction(0.95, 0)
 import os
 import time
 import sys
@@ -21,6 +10,7 @@ import cv2
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+from thop import profile
 
 # --- 1. 环境与路径标准化 ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -30,68 +20,68 @@ if PROJECT_ROOT not in sys.path:
 
 from utils import (
     ExperimentLogger,
-    calculate_psnr, calculate_ssim, calculate_enl, calculate_cnr, calculate_rmse, calculate_epi,
-    calculate_model_complexity
+    calculate_psnr, calculate_ssim, calculate_enl, calculate_cnr, calculate_rmse, calculate_epi
 )
 from models import get_model
 
 # ==========================================
 # 全局实验配置
 # ==========================================
-MODEL_NAME = "swin_us"
+MODEL_NAME = "us_drunet"
 SAVE_IMAGES = True
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# ====================== 新增开始 ======================
-torch.backends.cudnn.benchmark = True  # 开启推理加速，显存不变，速度提升30%
-if DEVICE.type == 'cuda':
-    torch.cuda.empty_cache()  # 提前释放显存，防止推理时显存溢出
-# ====================== 新增结束 ======================
 WEIGHTS_PATH = os.path.join(PROJECT_ROOT, f"checkpoints/{MODEL_NAME}/{MODEL_NAME}_best.pth")
 NOISE_LEVELS = [0.001, 0.02, 0.5]
-RESIZE_SHAPE = (128, 128)
 
 
-def run_swin_us_experiment():
+def estimate_nakagami_map(img_tensor):
     """
-    Swin-US 自动化评估流程
+    US-DRUNet 专用的统计参数估计函数
     """
-    # --- 2. 路径初始化 ---
+    b, _, h, w = img_tensor.shape
+    mu = torch.full((b, 1, h, w), 1.5).to(img_tensor.device)
+    omega = torch.mean(img_tensor, dim=(2, 3), keepdim=True).expand(b, 1, h, w)
+    return torch.cat([mu, omega], dim=1)
+
+
+def run_us_drunet_experiment():
     test_clean_dir = os.path.join(PROJECT_ROOT, "data/test/clean")
     results_dir = os.path.join(PROJECT_ROOT, "results")
-    qualitative_dir = os.path.join(results_dir, "qualitative")
     denoised_base_dir = os.path.join(results_dir, "denoised_images", MODEL_NAME)
-
-    os.makedirs(qualitative_dir, exist_ok=True)
+    qualitative_dir = os.path.join(results_dir, "qualitative")  # 补齐这个变量
     os.makedirs(denoised_base_dir, exist_ok=True)
+    os.makedirs(qualitative_dir, exist_ok=True)
 
     # --- 3. 模型准备 ---
     model = get_model(MODEL_NAME).to(DEVICE)
-
     if os.path.exists(WEIGHTS_PATH):
-        print(f"✅ 成功加载 Swin-US 权重: {WEIGHTS_PATH}")
         model.load_state_dict(torch.load(WEIGHTS_PATH, map_location=DEVICE))
-    else:
-        print(f"⚠️ 警告: 未找到 {MODEL_NAME} 权重文件！将使用随机初始化进行性能预估。")
-
+        print(f"✅ 已加载 {MODEL_NAME} 预训练权重。")
     model.eval()
 
-    # --- 4. 计算复杂度 ---
-    print("正在计算 Swin-US 复杂度 (Input: 128x128)...")
-    if DEVICE.type == 'cuda': torch.cuda.empty_cache()
-    params_count, gflops = calculate_model_complexity(model, input_size=(1, 1, 128, 128), device=DEVICE)
+    # --- 4. 计算复杂度 (US-DRUNet 特殊处理) ---
+    # 由于 metrics.py 不支持双输入，我们这里单独算一次
+    print("正在计算 US-DRUNet 复杂度 (Dual Input)...")
+    input_size = (1, 1, 256, 256)
+    dummy_img = torch.randn(input_size).to(DEVICE)
+    dummy_nak = estimate_nakagami_map(dummy_img)
+
+    params_count = sum(p.numel() for p in model.parameters()) / 1e6
+    gflops = 0.0
+    if profile:
+        # 特殊：inputs=(dummy_img, dummy_nak)
+        flops, _ = profile(model, inputs=(dummy_img, dummy_nak), verbose=False)
+        gflops = flops / 1e9
     print(f"Model Complexity -> Params: {params_count:.2f}M, GFLOPs: {gflops:.3f}")
 
     logger = ExperimentLogger(model_name=MODEL_NAME, root_dir=results_dir)
     results_summary = []
 
-    # --- 5. 遍历噪声等级进行测试 ---
+    # --- 5. 遍历噪声等级 ---
     for sigma_val in NOISE_LEVELS:
-        print(f"\n🌀 [Swin-US 评估中] Sigma: {sigma_val} | GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+        print(f"\n🚀 [US-DRUNet] Sigma: {sigma_val}")
         noisy_dir = os.path.join(PROJECT_ROOT, f"data/test/noisy_{sigma_val}")
-
-        if not os.path.exists(noisy_dir):
-            print(f"❌ 跳过: 找不到目录 {noisy_dir}")
-            continue
+        if not os.path.exists(noisy_dir): continue
 
         metrics_cache = {'psnr': [], 'ssim': [], 'rmse': [], 'epi': [], 'enl': [], 'cnr': [], 'time': []}
         img_names = [f for f in os.listdir(noisy_dir) if f.lower().endswith(('.jpg', '.png'))]
@@ -99,39 +89,37 @@ def run_swin_us_experiment():
         save_path = os.path.join(denoised_base_dir, f"sigma_{sigma_val}")
         if SAVE_IMAGES: os.makedirs(save_path, exist_ok=True)
 
-        # --- 5. 执行推理 ---
-        for name in tqdm(img_names, desc=f"{MODEL_NAME.upper()} Processing"):
+        # --- 6. 推理循环 ---
+        for name in tqdm(img_names):
             img_clean = cv2.imread(os.path.join(test_clean_dir, name), 0)
             img_noisy = cv2.imread(os.path.join(noisy_dir, name), 0)
-            if img_clean is None or img_noisy is None: continue
+            if img_clean is None: continue
 
-            ori_h, ori_w = img_clean.shape  # 关键！用干净图获取原始尺寸，绝对不会错
-            # Swin 专用预处理：Resize -> Tensor
-            img_noisy_resized = cv2.resize(img_noisy, RESIZE_SHAPE, interpolation=cv2.INTER_AREA)
-            input_tensor = torch.from_numpy(img_noisy_resized).float().div(255).unsqueeze(0).unsqueeze(0).to(DEVICE)
+            # 预处理
+            noisy_tensor = torch.from_numpy(img_noisy).float().div(255).unsqueeze(0).unsqueeze(0).to(DEVICE)
 
             with torch.no_grad():
-                torch.cuda.empty_cache() # ====================== 新增这1行 ======================
-
-                # --- 核心推理与计时 ---
+                # A. 计时开始
                 if DEVICE.type == 'cuda': torch.cuda.synchronize()
                 start_t = time.time()
 
-                output_tensor = model(input_tensor)
+                # B. 实时生成先验 + 前向传播
+                nak_map = estimate_nakagami_map(noisy_tensor)
+                output_tensor = model(noisy_tensor, nak_map)
 
+                # C. 计时结束
                 if DEVICE.type == 'cuda': torch.cuda.synchronize()
                 elapsed = time.time() - start_t
 
-                # 后处理：Tensor -> Numpy -> Resize Back
+                # D. 后处理
                 denoised = output_tensor.squeeze().cpu().clamp(0, 1).numpy() * 255
                 denoised = denoised.astype(np.uint8)
-                # 还原回原图尺寸，以便计算指标
-                denoised = cv2.resize(denoised, (ori_w, ori_h), interpolation=cv2.INTER_LINEAR)
 
-            # 计算与保存指标
             if SAVE_IMAGES:
-                logger.save_images(name, sigma_val, img_clean, img_noisy, denoised, save_path, qualitative_dir, img_names)
+                logger.save_images(name, sigma_val, img_clean, img_noisy, denoised, save_path, qualitative_dir,
+                                   img_names)
 
+            # 指标计算
             metrics_cache['psnr'].append(calculate_psnr(img_clean, denoised))
             metrics_cache['ssim'].append(calculate_ssim(img_clean, denoised))
             metrics_cache['rmse'].append(calculate_rmse(img_clean, denoised))
@@ -140,7 +128,7 @@ def run_swin_us_experiment():
             metrics_cache['cnr'].append(calculate_cnr(denoised))
             metrics_cache['time'].append(elapsed)
 
-        # --- 6. 数据汇总记录 ---
+        # --- 7. 数据汇总 ---
         res = {
             "Noise": sigma_val,
             "PSNR": f"{np.mean(metrics_cache['psnr']):.2f} ± {np.std(metrics_cache['psnr']):.2f}",
@@ -155,12 +143,11 @@ def run_swin_us_experiment():
         }
         results_summary.append(res)
 
-    # 记录结果
     df = pd.DataFrame(results_summary)
     logger.record_log(df)
     logger.save_csv(results_summary)
-    print(f"\n✅ Swin-US 评估任务圆满完成。结果已同步至：results/{MODEL_NAME}")
+    print(f"\n✅ US-DRUNet 评估任务结束。")
 
 
 if __name__ == "__main__":
-    run_swin_us_experiment()
+    run_us_drunet_experiment()

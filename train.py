@@ -17,8 +17,8 @@ def main():
         '--model',
         type=str,
         required=True,
-        choices=['dunet', 'swin_us', 'da_gated_ae'],
-        help="选择要训练的模型: 'dunet' (CNN基准), 'swin_us' (Transformer基准), 'da_gated_ae' (本文提出)"
+        choices=['dunet', 'us_drunet', 'swin_us', 'da_gated_ae'],
+        help="选择要训练的模型: 'dunet' (CNN基准), 'us_drunet' (CNN增强), 'swin_us' (Transformer基准), 'da_gated_ae' (本文提出)"
     )
 
     args = parser.parse_args()
@@ -26,6 +26,7 @@ def main():
     # --- 2. 脚本路径映射 ---
     scripts_map = {
         "dunet": "models/trainers/train_dunet.py",
+        "us_drunet": "models/trainers/train_us_drunet.py",
         "swin_us": "models/trainers/train_swin_us.py",
         "da_gated_ae": "models/trainers/train_da_gated_ae.py"
     }

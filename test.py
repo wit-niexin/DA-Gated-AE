@@ -2,7 +2,7 @@
 Module: Test Runner
 Description:
     全量测试调度中心。支持：
-    1. 传统基准与CNN基准: models/baselines/baseline_xxx.py
+    1. 传统基准与深度学习基准: models/baselines/baseline_xxx.py
     2. 提出的模型: models/evaluators/test_da_gated_ae.py
 """
 
@@ -20,7 +20,7 @@ if PROJECT_ROOT not in sys.path:
 def main():
     parser = argparse.ArgumentParser(description="PCOS Denoising Global Evaluator")
     parser.add_argument('--model', type=str, required=True,
-                        choices=['dunet', 'swin_us', 'da_gated_ae', 'srad', 'ibf', 'bm3d_us'],
+                        choices=['dunet', 'us_drunet', 'swin_us', 'da_gated_ae', 'ibf', 'srad', 'bm3d_us'],
                         help="选择要评估的模型")
     args = parser.parse_args()
 

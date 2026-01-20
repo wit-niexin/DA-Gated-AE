@@ -134,4 +134,4 @@ def run_da_gated_ae_experiment():
 
 
 if __name__ == "__main__":
-    run_da_gated_experiment()
+    run_da_gated_ae_experiment()

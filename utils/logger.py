@@ -57,6 +57,19 @@ class ExperimentLogger:
         df.to_csv(csv_path, index=False)
         return csv_path
 
+
+    def log_text(self, content):
+        """记录普通文本格式的日志（如训练开始/结束、策略触发等）"""
+        log_file = os.path.join(self.logs_dir, "experiment_history.log")
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"\n[{timestamp}] {content}\n")
+        
+        # 终端同时打印
+        print(f"[{timestamp}] {content}")
+        return log_file
+
     def record_log(self, df_summary):
         """
         将本次实验的详细参数和平均指标追加到 experiment_history.log 中，并打印到控制台。
@@ -102,7 +115,14 @@ class ExperimentLogger:
             qualitative_dir (str): 对比拼图保存目录。
             img_names_list (list): 用于切片选择少量图片生成对比图。
         """
-        # 1. 保存单张去噪后的结果
+        # 1. 确保所有图像尺寸一致（处理模型 Padding 导致的尺寸微差）
+        h, w = clean.shape
+        if noisy.shape != (h, w):
+            noisy = cv2.resize(noisy, (w, h))
+        if denoised.shape != (h, w):
+            denoised = cv2.resize(denoised, (w, h))
+
+        # 2. 保存单张去噪后的结果
         cv2.imwrite(os.path.join(save_path, name), denoised)
 
         # 2. 生成定性展示图 (Qualitative Visualization)

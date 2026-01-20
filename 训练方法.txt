@@ -4,5 +4,8 @@ python train.py --model da_gated_ae
 # 2. 训练 CNN 对标模型
 python train.py --model dunet
 
-# 3. 训练 Transformer 对标模型
+# 3. 训练 CNN 对标模型
+python train.py --model us_drunet
+
+# 4. 训练 Transformer 对标模型
 python train.py --model swin_us

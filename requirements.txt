@@ -3,7 +3,7 @@ torch>=1.10.0
 torchvision
 einops
 
-# 数据处理 (建议将 numpy 固定在 1.x 系列以保证兼容性)
+# 数据处理
 numpy>=1.23.5,<2.0.0
 pandas
 scipy
@@ -16,5 +16,6 @@ matplotlib
 bm3d
 pytorch-msssim
 
-# 进度条与工具
+# 工具
 tqdm>=4.64.0
+thop

@@ -25,68 +25,57 @@ PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "../../"))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-# 从 utils 门面接口导入工具
-from utils import ExperimentLogger, calculate_psnr, calculate_ssim, calculate_enl, calculate_cnr
+from utils import (
+    ExperimentLogger,
+    calculate_psnr,
+    calculate_ssim,
+    calculate_rmse,
+    calculate_enl,
+    calculate_cnr,
+    calculate_epi
+)
 
 # ==========================================
 # 全局实验配置
 # ==========================================
 SAVE_IMAGES = True
-N_ITER = 30  # 迭代次数：超声论文常用 30-50 轮。越多则越平滑，但计算耗时增加。
-DELTA_T = 0.05  # 步长：数值越小计算越稳定，数值越大去噪速度越快。
+N_ITER = 30  # 迭代次数
+DELTA_T = 0.05  # 时间步长
 NOISE_LEVELS = [0.001, 0.02, 0.5]
 
 
 def srad_filter(img, n_iter=30, delta_t=0.05):
     """
     SRAD 算法的 NumPy 高性能向量化实现。
-
-    Args:
-        img (ndarray): 输入灰度图像。
-        n_iter (int): 迭代轮数。
-        delta_t (float): 时间步长。
-    Returns:
-        ndarray: 去噪后的 8 位图像。
     """
-    # 1. 转换为浮点型进行高精度偏微分计算
     I = img.astype(np.float32)
-
-    # 初始散斑估计：根据迭代轮数预估对比度变异系数 q0
     q0 = np.exp(-n_iter * delta_t)
 
     for _ in range(n_iter):
-        # 2. 计算四个方向的梯度 (利用 roll 进行矩阵位移操作，避免慢速的 for 循环)
-        # dN = I(i-1, j) - I(i, j)
+        # 计算梯度 (利用 roll 进行矩阵位移)
         dN = np.roll(I, -1, axis=0) - I
         dS = np.roll(I, 1, axis=0) - I
         dW = np.roll(I, -1, axis=1) - I
         dE = np.roll(I, 1, axis=1) - I
 
-        # 3. 计算梯度的模长平方与拉普拉斯算子
-        # 这是衡量图像局部特征的核心统计量
+        # 计算局部特征统计量
         grad_sq = (dN ** 2 + dS ** 2 + dW ** 2 + dE ** 2) / (I ** 2 + 1e-10)
         laplacian = (dN + dS + dW + dE) / (I + 1e-10)
 
-        # 4. 计算瞬时散斑系数 q(t)
-        # 基于偏微分方程的公式，用于定位噪声与边缘
+        # 计算扩散系数 c(q)
         num = 0.5 * grad_sq - (1.0 / 16.0) * (laplacian ** 2)
         den = (1.0 + 0.25 * laplacian) ** 2
         q_sq = num / (den + 1e-10)
 
-        # 5. 计算扩散系数 c(q)
-        # 该系数决定了每个像素点的“扩散力度”
         c = 1.0 / (1.0 + (q_sq - q0 ** 2) / (q0 ** 2 * (1.0 + q0 ** 2) + 1e-10))
-        c = np.clip(c, 0, 1)  # 保持数值稳定性
+        c = np.clip(c, 0, 1)
 
-        # 6. 计算散度并更新图像
-        # 通过扩散系数调整各方向的更新权重
+        # 更新图像
         cS = np.roll(c, 1, axis=0)
         cE = np.roll(c, 1, axis=1)
-
         D = (c * dN + cS * dS + c * dW + cE * dE)
         I = I + (delta_t / 4.0) * D
 
-    # 还原到 0-255 范围并转回 8 位图
     return np.clip(I, 0, 255).astype(np.uint8)
 
 
@@ -100,11 +89,9 @@ def run_srad_experiment():
     qualitative_dir = os.path.join(results_dir, "qualitative")
     denoised_base_dir = os.path.join(results_dir, "denoised_images", "srad")
 
-    # 确保输出目录存在
     os.makedirs(qualitative_dir, exist_ok=True)
     os.makedirs(denoised_base_dir, exist_ok=True)
 
-    # 初始化 ExperimentLogger
     logger = ExperimentLogger(model_name="srad", root_dir=results_dir)
     results_summary = []
 
@@ -114,13 +101,17 @@ def run_srad_experiment():
         noisy_dir = os.path.join(PROJECT_ROOT, f"data/test/noisy_{sigma_val}")
 
         if not os.path.exists(noisy_dir):
+            print(f"⚠️ 警告: 找不到噪声目录 {noisy_dir}, 跳过此等级。")
             continue
 
-        # 准备该等级的指标容器
-        metrics_cache = {'psnr': [], 'ssim': [], 'enl': [], 'cnr': [], 'time': []}
-        img_names = [f for f in os.listdir(noisy_dir) if f.lower().endswith(('.jpg', '.png'))]
+        # 准备该等级的指标容器 (9大指标)
+        metrics_cache = {
+            'psnr': [], 'ssim': [], 'rmse': [],
+            'enl': [], 'cnr': [], 'epi': [],
+            'time': []
+        }
 
-        # 针对该噪声等级创建独立的保存子目录
+        img_names = [f for f in os.listdir(noisy_dir) if f.lower().endswith(('.jpg', '.png'))]
         save_path = os.path.join(denoised_base_dir, f"sigma_{sigma_val}")
         if SAVE_IMAGES:
             os.makedirs(save_path, exist_ok=True)
@@ -133,44 +124,61 @@ def run_srad_experiment():
             if img_clean is None or img_noisy is None:
                 continue
 
-            # 计时开始 (SRAD 的运算量通常是 IBF 的 10 倍以上)
+            # 计时开始
             start_t = time.time()
-
-            # 执行 SRAD 滤波
             denoised = srad_filter(img_noisy, n_iter=N_ITER, delta_t=DELTA_T)
-
             elapsed = time.time() - start_t
 
-            # 使用公共 Logger 保存产出
+            # 保存结果
             if SAVE_IMAGES:
                 logger.save_images(name, sigma_val, img_clean, img_noisy, denoised,
                                    save_path, qualitative_dir, img_names)
 
-            # 使用公共 Metrics 计算指标
+            # 指标计算
+            # 精度
             metrics_cache['psnr'].append(calculate_psnr(img_clean, denoised))
             metrics_cache['ssim'].append(calculate_ssim(img_clean, denoised))
+            metrics_cache['rmse'].append(calculate_rmse(img_clean, denoised))
+            # 物理
             metrics_cache['enl'].append(calculate_enl(denoised))
             metrics_cache['cnr'].append(calculate_cnr(denoised))
+            metrics_cache['epi'].append(calculate_epi(denoised, img_clean))
+            # 效率
             metrics_cache['time'].append(elapsed)
 
-        # --- 5. 统计当前等级的数据 ---
+        # --- 5. 汇总当前等级数据 ---
+        avg_time = np.mean(metrics_cache['time'])
+        fps = 1.0 / avg_time if avg_time > 0 else 0
+
         res = {
+            "Method": "SRAD",
             "Noise": sigma_val,
+            # 精度
             "PSNR": f"{np.mean(metrics_cache['psnr']):.2f} ± {np.std(metrics_cache['psnr']):.2f}",
             "SSIM": f"{np.mean(metrics_cache['ssim']):.4f} ± {np.std(metrics_cache['ssim']):.4f}",
+            "RMSE": f"{np.mean(metrics_cache['rmse']):.2f} ± {np.std(metrics_cache['rmse']):.2f}",
+            # 物理
             "ENL": f"{np.mean(metrics_cache['enl']):.2f} ± {np.std(metrics_cache['enl']):.2f}",
             "CNR": f"{np.mean(metrics_cache['cnr']):.2f} ± {np.std(metrics_cache['cnr']):.2f}",
-            "FPS": f"{1.0 / np.mean(metrics_cache['time']):.1f}",
-            "Params": "0 (PDE-based)"
+            "EPI": f"{np.mean(metrics_cache['epi']):.4f} ± {np.std(metrics_cache['epi']):.4f}",
+            # 效率 (PDE 算法无 Params/GFLOPs)
+            "Params(M)": "-",
+            "GFLOPs": "-",
+            "FPS": f"{fps:.1f}"
         }
         results_summary.append(res)
 
     # --- 6. 生成报告 ---
     df = pd.DataFrame(results_summary)
+    cols = ["Method", "Noise", "PSNR", "SSIM", "RMSE", "ENL", "CNR", "EPI", "Params(M)", "GFLOPs", "FPS"]
+    df = df[cols]
+
     csv_path = logger.save_csv(results_summary)
     log_path = logger.record_log(df)
 
-    print(f"\n✅ SRAD 实验完成！数据已记录至 {csv_path}")
+    print(f"\n✅ SRAD 实验完成！报告已生成。")
+    print(f"📊 CSV: {csv_path}")
+    print(f"📝 Log: {log_path}")
 
 
 if __name__ == "__main__":

@@ -8,42 +8,17 @@
 """
 
 import cv2
-import numpy as np
+import sys
 import os
 import random
 from tqdm import tqdm
+
+# 获取项目根目录，确保脚本在任何位置运行都能正确导入 utils
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
+
 from utils import SpeckleNoiseFactory
-
-
-def add_speckle_noise(image_array, sigma_sq):
-    """
-    【核心数学实现：乘性散斑噪声模型】
-    根据论文公式: Y = X + X * N
-    其中:
-        X 是干净图像 (Ground Truth)
-        N 是均值为 0, 方差为 sigma_sq 的高斯噪声
-        Y 是生成的含噪图像 (Noisy Image)
-
-    参数:
-        image_array: 原始灰度图像矩阵 [0, 255]
-        sigma_sq: 噪声方差 (论文中定义的等级：0.001, 0.02, 0.5)
-    """
-    # 步骤 1: 归一化处理
-    # 神经网络训练通常在 [0, 1] 空间进行，此处先转为浮点数，避免 uint8 溢出
-    image_f = image_array.astype(np.float32) / 255.0
-
-    # 步骤 2: 生成高斯分布的噪声矩阵 N
-    # np.random.normal 参数为 (均值, 标准差, 输出形状)
-    noise = np.random.normal(0, np.sqrt(sigma_sq), image_f.shape)
-
-    # 步骤 3: 应用乘性模型 (Multiplicative Model)
-    # 不同于常见的加性噪声 (X + N)，散斑噪声随信号强度增大而增大，这是超声成像的物理特性
-    noisy_f = image_f + image_f * noise
-
-    # 步骤 4: 后处理
-    # 裁剪 (Clip) 保证像素值不超出 [0, 1] 范围，然后恢复到 [0, 255] 的 8-bit 格式
-    noisy_f = np.clip(noisy_f, 0, 1)
-    return np.uint8(noisy_f * 255)
 
 
 def prepare_data():
@@ -109,12 +84,10 @@ def prepare_data():
             cv2.imwrite(os.path.join(clean_dir, filename), img_resized)
 
             # 5. 生成并保存噪声图
-            # 论文中提到在训练阶段 (Training Phase) 噪声是“Online”生成的。
+            # 论文中提到在训练阶段噪声是“Online”生成的。
             # 意味着在训练脚本的 DataLoader 中实时调用 add_speckle_noise。
-            # 本脚本目前采用 "Offline" 方式，为测试集 (Test Set) 提供固定的评价标准。
+            # 本脚本目前采用 "Offline" 方式，为测试集提供固定的评价标准。
             for s in sigmas:
-                # 这里可以调用本地实现的噪声方法，也可以调用噪声工厂的方法。
-                # img_noisy = add_speckle_noise(img_resized, s)
                 img_noisy = SpeckleNoiseFactory.add_speckle_noise(img_resized, s)
                 cv2.imwrite(os.path.join(noisy_dirs[s], filename), img_noisy)
 

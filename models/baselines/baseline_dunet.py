@@ -26,8 +26,10 @@ PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "../../"))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-# 导入工具与模型
-from utils import ExperimentLogger, calculate_psnr, calculate_ssim, calculate_enl, calculate_cnr
+from utils import (
+    ExperimentLogger,
+    calculate_psnr, calculate_ssim, calculate_enl, calculate_cnr, calculate_rmse, calculate_epi, calculate_model_complexity
+)
 from models import get_model
 
 # ==========================================
@@ -39,6 +41,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # 权重文件路径
 WEIGHTS_PATH = os.path.join(PROJECT_ROOT, "checkpoints/dunet/dunet_best.pth")
 NOISE_LEVELS = [0.001, 0.02, 0.5]
+
 
 def run_dunet_experiment():
     """
@@ -54,21 +57,20 @@ def run_dunet_experiment():
     os.makedirs(denoised_base_dir, exist_ok=True)
 
     # --- 3. 模型准备 ---
-    # 使用工厂函数获取模型实例并搬运至 GPU
     model = get_model("dunet").to(DEVICE)
 
     # 加载预训练权重
     if os.path.exists(WEIGHTS_PATH):
         print(f"✅ 成功加载权重: {WEIGHTS_PATH}")
-        # map_location 确保了在不同设备间迁移时的兼容性
         model.load_state_dict(torch.load(WEIGHTS_PATH, map_location=DEVICE))
     else:
         print(f"⚠️ 警告: 未找到权重文件！将使用随机初始化的模型进行测试（仅用于代码自检）。")
 
     model.eval()  # 必须步骤：将模型设为评估模式，关闭 Dropout 和 BatchNormalization 的更新
 
-    # 统计模型参数量 (单位: M, 百万)
-    params_count = sum(p.numel() for p in model.parameters()) / 1e6
+    print("正在计算模型复杂度...")
+    params_count, gflops = calculate_model_complexity(model, input_size=(1, 1, 256, 256), device=DEVICE)
+    print(f"Model Complexity -> Params: {params_count:.2f}M, GFLOPs: {gflops:.3f}")
 
     # 初始化日志记录器
     logger = ExperimentLogger(model_name="dunet", root_dir=results_dir)
@@ -79,43 +81,50 @@ def run_dunet_experiment():
         print(f"\n🚀 [DU-Net 评估中] 噪声等级: {sigma_val} | 运行设备: {DEVICE}")
         noisy_dir = os.path.join(PROJECT_ROOT, f"data/test/noisy_{sigma_val}")
 
-        if not os.path.exists(noisy_dir): continue
+        if not os.path.exists(noisy_dir):
+            continue
 
-        metrics_cache = {'psnr': [], 'ssim': [], 'enl': [], 'cnr': [], 'time': []}
+        metrics_cache = {'psnr': [], 'ssim': [], 'rmse': [], 'epi': [], 'enl': [], 'cnr': [], 'time': []}
         img_names = [f for f in os.listdir(noisy_dir) if f.lower().endswith(('.jpg', '.png'))]
 
         save_path = os.path.join(denoised_base_dir, f"sigma_{sigma_val}")
-        if SAVE_IMAGES: os.makedirs(save_path, exist_ok=True)
+        if SAVE_IMAGES:
+            os.makedirs(save_path, exist_ok=True)
 
         # --- 5. 推理循环 ---
         for name in tqdm(img_names, desc=f"DU-Net Sigma {sigma_val}"):
             img_clean = cv2.imread(os.path.join(test_clean_dir, name), 0)
             img_noisy = cv2.imread(os.path.join(noisy_dir, name), 0)
-            if img_clean is None or img_noisy is None: continue
+            if img_clean is None or img_noisy is None:
+                continue
 
             # --- 预处理 (Preprocessing) ---
             # 1. 转为 Tensor  2. 归一化 [0,1]  3. 增加 Batch 和 Channel 维度 [1, 1, H, W]
             input_tensor = torch.from_numpy(img_noisy).float().div(255).unsqueeze(0).unsqueeze(0).to(DEVICE)
 
             # --- 推理 (Inference) ---
-            start_t = time.time()
             with torch.no_grad():  # 核心：推理时禁止梯度计算，显著降低显存占用
+                if DEVICE.type == 'cuda': torch.cuda.synchronize()
+                start_t = time.time()
+
                 output_tensor = model(input_tensor)
+
+                if DEVICE.type == 'cuda': torch.cuda.synchronize()
+                elapsed = time.time() - start_t
 
                 # --- 后处理 (Post-processing) ---
                 # 1. 降维  2. 截断异常值 [0,1]  3. 搬回 CPU  4. 恢复 0-255 并转为 uint8
                 denoised = output_tensor.squeeze().cpu().clamp(0, 1).numpy() * 255
                 denoised = denoised.astype(np.uint8)
 
-            elapsed = time.time() - start_t
-
-            # --- 保存与指标计算 (调用公共模块) ---
+            # --- 保存与指标计算 ---
             if SAVE_IMAGES:
-                logger.save_images(name, sigma_val, img_clean, img_noisy, denoised,
-                                   save_path, qualitative_dir, img_names)
+                logger.save_images(name, sigma_val, img_clean, img_noisy, denoised, save_path, qualitative_dir, img_names)
 
             metrics_cache['psnr'].append(calculate_psnr(img_clean, denoised))
             metrics_cache['ssim'].append(calculate_ssim(img_clean, denoised))
+            metrics_cache['rmse'].append(calculate_rmse(img_clean, denoised)) 
+            metrics_cache['epi'].append(calculate_epi(denoised, img_clean))   
             metrics_cache['enl'].append(calculate_enl(denoised))
             metrics_cache['cnr'].append(calculate_cnr(denoised))
             metrics_cache['time'].append(elapsed)
@@ -125,9 +134,12 @@ def run_dunet_experiment():
             "Noise": sigma_val,
             "PSNR": f"{np.mean(metrics_cache['psnr']):.2f} ± {np.std(metrics_cache['psnr']):.2f}",
             "SSIM": f"{np.mean(metrics_cache['ssim']):.4f} ± {np.std(metrics_cache['ssim']):.4f}",
+            "RMSE": f"{np.mean(metrics_cache['rmse']):.2f} ± {np.std(metrics_cache['rmse']):.2f}",
+            "EPI": f"{np.mean(metrics_cache['epi']):.4f} ± {np.std(metrics_cache['epi']):.4f}",
             "ENL": f"{np.mean(metrics_cache['enl']):.2f} ± {np.std(metrics_cache['enl']):.2f}",
             "CNR": f"{np.mean(metrics_cache['cnr']):.2f} ± {np.std(metrics_cache['cnr']):.2f}",
             "FPS": f"{1.0 / np.mean(metrics_cache['time']):.1f}",
+            "GFLOPs": f"{gflops:.3f}",
             "Params": f"{params_count:.2f} M"
         }
         results_summary.append(res)
