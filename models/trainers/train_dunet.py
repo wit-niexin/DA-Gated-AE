@@ -5,8 +5,7 @@ Description:
 
 Research Strategy:
     1. 统一损失函数 (Hybrid Loss):
-       为了确保架构对比的公平性，本脚本放弃了原论文可能使用的简单 MSE，
-       转而采用与 DA-Gated AE 完全一致的混合损失函数（Charbonnier + SSIM + Edge）。
+       为了确保架构对比的公平性，采用与 DA-Gated AE 完全一致的混合损失函数（Charbonnier + SSIM + Edge）。
        这确保了实验结论的差异性仅来源于网络拓扑结构。
     2. 实验追踪 (Experiment Tracking):
        引入 ExperimentLogger，确保基准模型的收敛曲线可追溯、可对比。
@@ -15,6 +14,7 @@ Research Strategy:
 import os
 import sys
 import torch
+import numpy as np
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -25,7 +25,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "../../"))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-from utils import DenoisingDataset, ExperimentLogger
+from utils import DenoisingDataset, ExperimentLogger, calculate_psnr
 from utils.losses import HybridLoss  # 导入相同的混合损失
 from models import get_model
 
@@ -34,7 +34,7 @@ from models import get_model
 # ==========================================
 MODEL_NAME = "dunet"
 BATCH_SIZE = 16
-EPOCHS = 100
+EPOCHS = 300
 LR = 1e-4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -45,6 +45,22 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 
+def validate(model, val_loader):
+    model.eval()
+    psnr_list = []
+    with torch.no_grad():
+        for noisy, clean in val_loader:
+            noisy, clean = noisy.to(DEVICE), clean.to(DEVICE)
+            output = model(noisy)
+            # 转为 Numpy 计算指标
+            clean_np = (clean.cpu().numpy() * 255).astype('uint8')
+            output_np = (torch.clamp(output, 0, 1).cpu().numpy() * 255).astype('uint8')
+            for i in range(clean_np.shape[0]):
+                psnr = calculate_psnr(clean_np[i, 0], output_np[i, 0])
+                psnr_list.append(psnr)
+    return np.mean(psnr_list)
+
+
 def train():
     """
     DU-Net 核心训练流程
@@ -53,30 +69,26 @@ def train():
     logger = ExperimentLogger(model_name=MODEL_NAME, root_dir=RESULTS_DIR)
     logger.log_text(f"🔔 [Baseline] 启动 {MODEL_NAME} 对标训练 | 设备: {DEVICE}")
 
-    # --- 3. 数据准备 ---
+    # --- 3. 数据准备 (同步修改为包含 Val 集) ---
     train_dataset = DenoisingDataset(
         clean_dir=os.path.join(PROJECT_ROOT, "data/train/clean"),
         noisy_root=os.path.join(PROJECT_ROOT, "data/train"),
         patch_size=256
     )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
+    val_dataset = DenoisingDataset(
+        clean_dir=os.path.join(PROJECT_ROOT, "data/val/clean"),
+        noisy_root=os.path.join(PROJECT_ROOT, "data/val"),
+        patch_size=256
     )
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
 
     # --- 4. 架构与目标函数初始化 ---
     model = get_model(MODEL_NAME).to(DEVICE)
 
     # 使用混合损失函数代替单 MSELoss
-    criterion = HybridLoss(
-        lambda_rec=1.0,
-        lambda_ssim=0.5,
-        lambda_edge=0.1
-    ).to(DEVICE)
+    criterion = HybridLoss(lambda_rec=1.0, lambda_ssim=0.5, lambda_edge=0.1).to(DEVICE)
 
     optimizer = optim.Adam(model.parameters(), lr=LR)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.5)
@@ -84,7 +96,9 @@ def train():
     print(f"🚀 实验对标启动 | 模型: {MODEL_NAME} | 目标函数: HybridLoss")
 
     # --- 5. 训练核心循环 ---
-    best_loss = float('inf')
+    best_psnr = 0.0  # 【同步修改】判据改为 PSNR
+    patience_count = 0
+    EARLY_STOP_PATIENCE = 30
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -113,35 +127,41 @@ def train():
         current_lr = optimizer.param_groups[0]['lr']
         scheduler.step()
 
-        # --- 6. 实验指标持久化 ---
-        # 记录每轮数据至 CSV，用于后期绘制收敛对比图
+        # --- 6. 验证与最优模型保存 (每 5 轮) ---
+        if epoch % 5 == 0:
+            val_psnr = validate(model, val_loader)
+            log_msg = f"Epoch {epoch}: Loss={avg_epoch_loss:.5f} | Val PSNR={val_psnr:.2f}dB"
+
+            if val_psnr > best_psnr:
+                best_psnr = val_psnr
+                patience_count = 0
+                best_path = os.path.join(CHECKPOINT_DIR, f"{MODEL_NAME}_best.pth")
+                torch.save(model.state_dict(), best_path)
+                log_msg += " ⭐ (New Best!)"
+            else:
+                patience_count += 1
+
+            print(log_msg)
+            logger.log_text(log_msg)
+
+            if patience_count >= EARLY_STOP_PATIENCE:
+                print("🛑 触发早停。")
+                break
+
+        # 记录每轮数据至 CSV
         logger.save_csv([{
             "epoch": epoch,
             "loss": f"{avg_epoch_loss:.6f}",
             "lr": f"{current_lr:.2e}",
-            "best_loss": f"{min(best_loss, avg_epoch_loss):.6f}"
+            "best_psnr": f"{best_psnr:.2f}"
         }])
 
-        # 逻辑 A: 保存“最优权重” (供 Baseline 测试脚本读取)
-        if avg_epoch_loss < best_loss:
-            best_loss = avg_epoch_loss
-            best_path = os.path.join(CHECKPOINT_DIR, f"{MODEL_NAME}_best.pth")
-            torch.save(model.state_dict(), best_path)
-            log_msg = f"⭐ Epoch {epoch}: 发现更优基准模型 (Loss: {avg_epoch_loss:.6f})"
-        else:
-            log_msg = f"Epoch {epoch}: Avg Loss = {avg_epoch_loss:.6f}"
-
-        # 将进度同时写入控制台和 TXT 日志
-        if epoch % 1 == 0:  # 每一轮都记录日志
-            logger.log_text(log_msg)
-
-        # 逻辑 B: 每 10 轮定期归档
+        # 每 10 轮定期归档
         if epoch % 10 == 0:
             save_path = os.path.join(CHECKPOINT_DIR, f"{MODEL_NAME}_epoch_{epoch}.pth")
             torch.save(model.state_dict(), save_path)
-            print(f"💾 基准备份: {save_path}")
 
-    logger.log_text(f"🎉 {MODEL_NAME} 训练任务圆满完成。最优损失: {best_loss:.6f}")
+    logger.log_text(f"🎉 {MODEL_NAME} 训练任务圆满完成。最优 PSNR: {best_psnr:.2f}")
 
 
 if __name__ == "__main__":

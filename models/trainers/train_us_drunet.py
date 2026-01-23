@@ -12,6 +12,7 @@ Key Adjustments for US-DRUNet:
 import os
 import sys
 import torch
+import numpy as np
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -22,7 +23,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "../../"))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-from utils import DenoisingDataset, ExperimentLogger
+from utils import DenoisingDataset, ExperimentLogger, calculate_psnr
 from utils.losses import HybridLoss
 from models import get_model
 
@@ -30,8 +31,8 @@ from models import get_model
 # 训练超参数配置
 # ==========================================
 MODEL_NAME = "us_drunet"
-BATCH_SIZE = 8  # 由于 US-DRUNet 参数量大，如果显存不足可适当调小
-EPOCHS = 100
+BATCH_SIZE = 16
+EPOCHS = 300
 LR = 1e-4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -48,13 +49,28 @@ def estimate_nakagami_param(img_tensor):
     根据输入图像实时估计 Nakagami 统计参数图 (mu, omega)。
     这是 US-DRUNet 区别于普通 CNN 的关键输入。
     """
-    # 在实际科研代码中，这里通常通过局部滑动窗口计算
-    # 为保持 Demo 逻辑清晰，我们生成与输入尺寸一致的参数占位图
-    # 维度: [B, 2, H, W] -> 通道 0 是 mu, 通道 1 是 omega
     b, _, h, w = img_tensor.shape
-    mu = torch.full((b, 1, h, w), 1.5).to(img_tensor.device)      # 典型超声 mu 值
+    mu = torch.full((b, 1, h, w), 1.5).to(img_tensor.device)
     omega = torch.mean(img_tensor, dim=(2, 3), keepdim=True).expand(b, 1, h, w)
     return torch.cat([mu, omega], dim=1)
+
+
+def validate(model, val_loader):
+    model.eval()
+    psnr_list = []
+    with torch.no_grad():
+        for noisy, clean in val_loader:
+            noisy, clean = noisy.to(DEVICE), clean.to(DEVICE)
+            # US-DRUNet 特有的辅助输入
+            nak_map = estimate_nakagami_param(noisy)
+            output = model(noisy, nak_map)
+
+            clean_np = (clean.cpu().numpy() * 255).astype('uint8')
+            output_np = (torch.clamp(output, 0, 1).cpu().numpy() * 255).astype('uint8')
+            for i in range(clean_np.shape[0]):
+                psnr = calculate_psnr(clean_np[i, 0], output_np[i, 0])
+                psnr_list.append(psnr)
+    return np.mean(psnr_list)
 
 
 def train():
@@ -63,39 +79,34 @@ def train():
     """
     # --- 2. 初始化日志记录器 ---
     logger = ExperimentLogger(model_name=MODEL_NAME, root_dir=RESULTS_DIR)
-    logger.log_text(f"🔔 [Baseline] 启动 {MODEL_NAME} 训练 | 策略: 统计嵌入 + 随机噪声")
+    logger.log_text(f"🔔 [Baseline] 启动 {MODEL_NAME} 训练 | 策略: 统计嵌入 + 验证集考核")
 
-    # --- 3. 数据准备 (使用我们决定的随机混合噪声逻辑) ---
+    # --- 3. 数据准备 ---
     train_dataset = DenoisingDataset(
         clean_dir=os.path.join(PROJECT_ROOT, "data/train/clean"),
         noisy_root=os.path.join(PROJECT_ROOT, "data/train"),
         patch_size=256
     )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
+    val_dataset = DenoisingDataset(
+        clean_dir=os.path.join(PROJECT_ROOT, "data/val/clean"),
+        noisy_root=os.path.join(PROJECT_ROOT, "data/val"),
+        patch_size=256
     )
 
-    # --- 4. 架构与目标函数初始化 ---
-    # 这里的 get_model("us_drunet") 应该返回我们之前写的 USDRUNet 类
-    model = get_model(MODEL_NAME).to(DEVICE)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
 
-    # 【修正】严格对标论文 4.1.2 节确定的最佳权重：1.0, 0.5, 0.1
-    criterion = HybridLoss(
-        lambda_rec=1.0,
-        lambda_ssim=0.5,
-        lambda_edge=0.1
-    ).to(DEVICE)
+    # --- 4. 架构与目标函数初始化 ---
+    model = get_model(MODEL_NAME).to(DEVICE)
+    criterion = HybridLoss(lambda_rec=1.0, lambda_ssim=0.5, lambda_edge=0.1).to(DEVICE)
 
     optimizer = optim.Adam(model.parameters(), lr=LR)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
     # --- 5. 训练核心循环 ---
-    best_loss = float('inf')
+    best_psnr = 0.0  # 【同步修改】
+    patience_count = 0
+    EARLY_STOP_PATIENCE = 30
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -104,15 +115,11 @@ def train():
         loop = tqdm(train_loader, leave=False)
         for batch_idx, (noisy, clean) in enumerate(loop):
             noisy, clean = noisy.to(DEVICE), clean.to(DEVICE)
-
-            # Step A: 准备统计先验输入 (Nakagami Map)
             nak_map = estimate_nakagami_param(noisy)
 
-            # Step B: 前向传播 (传递两个参数)
             output = model(noisy, nak_map)
             loss = criterion(output, clean)
 
-            # Step C: 反向传播
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -121,30 +128,38 @@ def train():
             loop.set_description(f"Epoch [{epoch}/{EPOCHS}]")
             loop.set_postfix(loss=loss.item())
 
-        # 汇总与记录
         avg_epoch_loss = epoch_loss / len(train_loader)
         current_lr = optimizer.param_groups[0]['lr']
         scheduler.step()
 
-        # --- 6. 实验指标保存 ---
+        # --- 6. 验证与保存 (每 5 轮) ---
+        if epoch % 5 == 0:
+            val_psnr = validate(model, val_loader)
+            log_msg = f"Epoch {epoch}: Loss={avg_epoch_loss:.5f} | Val PSNR={val_psnr:.2f}dB"
+
+            if val_psnr > best_psnr:
+                best_psnr = val_psnr
+                patience_count = 0
+                torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, f"{MODEL_NAME}_best.pth"))
+                log_msg += " ⭐ (New Best!)"
+            else:
+                patience_count += 1
+
+            print(log_msg)
+            logger.log_text(log_msg)
+
+            if patience_count >= EARLY_STOP_PATIENCE:
+                break
+
+        # --- 实验指标保存 ---
         logger.save_csv([{
             "epoch": epoch,
             "loss": f"{avg_epoch_loss:.6f}",
-            "lr": f"{current_lr:.2e}"
+            "lr": f"{current_lr:.2e}",
+            "best_psnr": best_psnr
         }])
 
-        # 保存最优基准模型权重
-        if avg_epoch_loss < best_loss:
-            best_loss = avg_epoch_loss
-            best_path = os.path.join(CHECKPOINT_DIR, f"{MODEL_NAME}_best.pth")
-            torch.save(model.state_dict(), best_path)
-            log_msg = f"⭐ Epoch {epoch}: 发现更优 US-DRUNet (Loss: {avg_epoch_loss:.6f})"
-        else:
-            log_msg = f"Epoch {epoch}: Avg Loss = {avg_epoch_loss:.6f}"
-
-        logger.log_text(log_msg)
-
-    logger.log_text(f"🎉 {MODEL_NAME} 训练完成。最优损失: {best_loss:.6f}")
+    logger.log_text(f"🎉 {MODEL_NAME} 训练完成。最优 PSNR: {best_psnr:.2f}")
 
 
 if __name__ == "__main__":
