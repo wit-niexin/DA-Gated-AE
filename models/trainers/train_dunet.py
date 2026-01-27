@@ -46,19 +46,37 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 
 
 def validate(model, val_loader):
+    """验证集评估逻辑：计算HybridLoss（与训练目标一致）"""
     model.eval()
-    psnr_list = []
+    total_loss = 0
+    count = 0
+    criterion = HybridLoss(lambda_rec=1.0, lambda_ssim=0.5, lambda_edge=0.1).to(DEVICE)
+    
     with torch.no_grad():
         for noisy, clean in val_loader:
             noisy, clean = noisy.to(DEVICE), clean.to(DEVICE)
             output = model(noisy)
-            # 转为 Numpy 计算指标
-            clean_np = (clean.cpu().numpy() * 255).astype('uint8')
-            output_np = (torch.clamp(output, 0, 1).cpu().numpy() * 255).astype('uint8')
-            for i in range(clean_np.shape[0]):
-                psnr = calculate_psnr(clean_np[i, 0], output_np[i, 0])
-                psnr_list.append(psnr)
-    return np.mean(psnr_list)
+            loss = criterion(output, clean)
+            total_loss += loss.item()
+            count += 1
+    
+    return total_loss / count
+
+# 原始PSNR验证函数（已注释，保留用于对比分析）
+# def validate_psnr(model, val_loader):
+#     model.eval()
+#     psnr_list = []
+#     with torch.no_grad():
+#         for noisy, clean in val_loader:
+#             noisy, clean = noisy.to(DEVICE), clean.to(DEVICE)
+#             output = model(noisy)
+#             # 转为 Numpy 计算指标
+#             clean_np = (clean.cpu().numpy() * 255).astype('uint8')
+#             output_np = (torch.clamp(output, 0, 1).cpu().numpy() * 255).astype('uint8')
+#             for i in range(clean_np.shape[0]):
+#                 psnr = calculate_psnr(clean_np[i, 0], output_np[i, 0])
+#                 psnr_list.append(psnr)
+#     return np.mean(psnr_list)
 
 
 def train():
@@ -96,7 +114,7 @@ def train():
     print(f"🚀 实验对标启动 | 模型: {MODEL_NAME} | 目标函数: HybridLoss")
 
     # --- 5. 训练核心循环 ---
-    best_psnr = 0.0  # 【同步修改】判据改为 PSNR
+    best_loss = float('inf')  # 【修改】改为基于loss保存（越小越好）
     patience_count = 0
     EARLY_STOP_PATIENCE = 30
 
@@ -129,11 +147,11 @@ def train():
 
         # --- 6. 验证与最优模型保存 (每 5 轮) ---
         if epoch % 5 == 0:
-            val_psnr = validate(model, val_loader)
-            log_msg = f"Epoch {epoch}: Loss={avg_epoch_loss:.5f} | Val PSNR={val_psnr:.2f}dB"
+            val_loss = validate(model, val_loader)
+            log_msg = f"Epoch {epoch}: Loss={avg_epoch_loss:.5f} | Val Loss={val_loss:.5f}"
 
-            if val_psnr > best_psnr:
-                best_psnr = val_psnr
+            if val_loss < best_loss:
+                best_loss = val_loss
                 patience_count = 0
                 best_path = os.path.join(CHECKPOINT_DIR, f"{MODEL_NAME}_best.pth")
                 torch.save(model.state_dict(), best_path)
@@ -153,15 +171,29 @@ def train():
             "epoch": epoch,
             "loss": f"{avg_epoch_loss:.6f}",
             "lr": f"{current_lr:.2e}",
-            "best_psnr": f"{best_psnr:.2f}"
+            "best_loss": f"{best_loss:.5f}"
         }])
+
+# 原始PSNR保存逻辑（已注释，保留用于对比分析）
+# if epoch % 5 == 0:
+#     val_psnr = validate_psnr(model, val_loader)
+#     log_msg = f"Epoch {epoch}: Loss={avg_epoch_loss:.5f} | Val PSNR={val_psnr:.2f}dB"
+#
+#     if val_psnr > best_psnr:
+#         best_psnr = val_psnr
+#         patience_count = 0
+#         best_path = os.path.join(CHECKPOINT_DIR, f"{MODEL_NAME}_best.pth")
+#         torch.save(model.state_dict(), best_path)
+#         log_msg += " ⭐ (New Best!)"
+#     else:
+#         patience_count += 1
 
         # 每 10 轮定期归档
         if epoch % 10 == 0:
             save_path = os.path.join(CHECKPOINT_DIR, f"{MODEL_NAME}_epoch_{epoch}.pth")
             torch.save(model.state_dict(), save_path)
 
-    logger.log_text(f"🎉 {MODEL_NAME} 训练任务圆满完成。最优 PSNR: {best_psnr:.2f}")
+    logger.log_text(f"🎉 {MODEL_NAME} 训练任务圆满完成。最优 Loss: {best_loss:.5f}")
 
 
 if __name__ == "__main__":

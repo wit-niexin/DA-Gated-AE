@@ -37,22 +37,40 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 
 def validate(model, val_loader):
-    """验证集评估逻辑：计算平均 PSNR"""
+    """验证集评估逻辑：计算HybridLoss（与训练目标一致）"""
     model.eval()
-    psnr_list = []
+    total_loss = 0
+    count = 0
+    criterion = HybridLoss(lambda_rec=1.0, lambda_ssim=0.5, lambda_edge=0.1).to(DEVICE)
+    
     with torch.no_grad():
         for noisy, clean in val_loader:
             noisy, clean = noisy.to(DEVICE), clean.to(DEVICE)
             output = model(noisy)
+            loss = criterion(output, clean)
+            total_loss += loss.item()
+            count += 1
+    
+    return total_loss / count
 
-            # 转为 Numpy 计算指标
-            clean_np = (clean.cpu().numpy() * 255).astype('uint8')
-            output_np = (torch.clamp(output, 0, 1).cpu().numpy() * 255).astype('uint8')
-
-            for i in range(clean_np.shape[0]):
-                psnr = calculate_psnr(clean_np[i, 0], output_np[i, 0])
-                psnr_list.append(psnr)
-    return np.mean(psnr_list)
+# 原始PSNR验证函数（已注释，保留用于对比分析）
+# def validate_psnr(model, val_loader):
+#     """验证集评估逻辑：计算平均 PSNR"""
+#     model.eval()
+#     psnr_list = []
+#     with torch.no_grad():
+#         for noisy, clean in val_loader:
+#             noisy, clean = noisy.to(DEVICE), clean.to(DEVICE)
+#             output = model(noisy)
+#
+#             # 转为 Numpy 计算指标
+#             clean_np = (clean.cpu().numpy() * 255).astype('uint8')
+#             output_np = (torch.clamp(output, 0, 1).cpu().numpy() * 255).astype('uint8')
+#
+#             for i in range(clean_np.shape[0]):
+#                 psnr = calculate_psnr(clean_np[i, 0], output_np[i, 0])
+#                 psnr_list.append(psnr)
+#     return np.mean(psnr_list)
 
 
 def train():
@@ -81,11 +99,12 @@ def train():
     criterion = HybridLoss(lambda_rec=1.0, lambda_ssim=0.5, lambda_edge=0.1).to(DEVICE)
     logger = ExperimentLogger(model_name=MODEL_NAME, root_dir=RESULTS_DIR)
 
-    best_psnr = 0.0
+    best_loss = float('inf')  # 改为基于loss保存（越小越好）
     patience_count = 0
     EARLY_STOP_PATIENCE = 30
 
-    print(f"🔥 {MODEL_NAME} 训练启动 (静态公平对比模式)")
+    print(f"🔥 {MODEL_NAME} 训练启动 (HybridLoss保存策略)")
+    print("📊 保存策略: 基于HybridLoss保存最优模型（与训练目标一致）")
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -109,14 +128,14 @@ def train():
 
         # --- 4. 验证与最优模型保存 (每 5 轮) ---
         if epoch % 5 == 0:
-            val_psnr = validate(model, val_loader)
-            print(f"Epoch {epoch}: Loss={avg_loss:.5f} | Val PSNR={val_psnr:.2f}dB")
+            val_loss = validate(model, val_loader)
+            print(f"Epoch {epoch}: Loss={avg_loss:.5f} | Val Loss={val_loss:.5f}")
 
-            if val_psnr > best_psnr:
-                best_psnr = val_psnr
+            if val_loss < best_loss:
+                best_loss = val_loss
                 patience_count = 0
                 torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, f"{MODEL_NAME}_best.pth"))
-                print(f"⭐ 发现新高！权重已保存至 {MODEL_NAME}_best.pth")
+                print(f"⭐ 发现新低！权重已保存至 {MODEL_NAME}_best.pth")
             else:
                 patience_count += 1
 
@@ -125,9 +144,22 @@ def train():
                 break
 
         # 记录日志
-        logger.save_csv([{"epoch": epoch, "loss": avg_loss, "best_psnr": best_psnr}])
+        logger.save_csv([{"epoch": epoch, "loss": avg_loss, "best_loss": best_loss}])
 
-    print(f"✅ 训练圆满完成。最高 PSNR: {best_psnr:.2f}")
+    print(f"✅ 训练圆满完成。最低 Loss: {best_loss:.5f}")
+
+# 原始PSNR保存逻辑（已注释，保留用于对比分析）
+# if epoch % 5 == 0:
+#     val_psnr = validate_psnr(model, val_loader)
+#     print(f"Epoch {epoch}: Loss={avg_loss:.5f} | Val PSNR={val_psnr:.2f}dB")
+#
+#     if val_psnr > best_psnr:
+#         best_psnr = val_psnr
+#         patience_count = 0
+#         torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, f"{MODEL_NAME}_best.pth"))
+#         print(f"⭐ 发现新高！权重已保存至 {MODEL_NAME}_best.pth")
+#     else:
+#         patience_count += 1
 
 
 if __name__ == "__main__":
