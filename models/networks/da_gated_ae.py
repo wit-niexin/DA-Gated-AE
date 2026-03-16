@@ -22,8 +22,7 @@ class DSCBlock(nn.Module):
 
     def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, stride=1):
         super(DSCBlock, self).__init__()
-        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size,
-                                   padding=padding, stride=stride, groups=in_channels)
+        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, padding=padding, stride=stride, groups=in_channels)
         self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1)
         self.bn = nn.BatchNorm2d(out_channels)
         self.act = nn.LeakyReLU(0.2, inplace=True)
@@ -34,6 +33,17 @@ class DSCBlock(nn.Module):
         x = self.bn(x)
         return self.act(x)
 
+
+"""标准卷积块 (用于消融实验对比)"""
+class StandardConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, stride=1):
+        super(StandardConvBlock, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding, stride=stride)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.act = nn.LeakyReLU(0.2, inplace=True)
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
 
 # ==========================================
 # 2. DA-Gate 子模块 - 通道注意力 (CAM)
@@ -125,21 +135,35 @@ class UpsampleBlock(nn.Module):
         return self.up(x)
 
 class DAGatedAE(nn.Module):
-    def __init__(self, in_channels=1, out_channels=1, base_feat=32):
+    """
+        Proposed DA-Gated AE with Ablation Support.
+        Args:
+            in_channels (int): 输入通道.
+            out_channels (int): 输出通道.
+            base_feat (int): 初始通道数.
+            use_gate (bool): 是否激活 DA-Gate 模块. 默认为 True.
+            use_dsc (bool): 是否使用深度可分离卷积. 如果为 False，则使用标准卷积.
+        """
+    def __init__(self, in_channels=1, out_channels=1, base_feat=32, use_gate=True, use_dsc=True):
         super(DAGatedAE, self).__init__()
+        self.use_gate = use_gate
+        self.use_dsc = use_dsc
+
+        # 动态选择卷积块类型
+        self.Block = DSCBlock if use_dsc else StandardConvBlock
 
         # --- Step 1: Lightweight Encoding ---
         self.enc1 = self._make_dsc_layer(in_channels, base_feat)
         self.enc2 = self._make_dsc_layer(base_feat, base_feat * 2)
         self.enc3 = self._make_dsc_layer(base_feat * 2, base_feat * 4)
         self.enc4 = self._make_dsc_layer(base_feat * 4, base_feat * 8)  # Bottleneck
-
         self.pool = nn.MaxPool2d(2)
 
-        # --- Step 2: DA-Gate ---
-        self.gate1 = DAGate(base_feat)
-        self.gate2 = DAGate(base_feat * 2)
-        self.gate3 = DAGate(base_feat * 4)
+        # --- Step 2: DA-Gates (仅在 use_gate=True 时初始化) ---
+        if self.use_gate:
+            self.gate1 = DAGate(base_feat)
+            self.gate2 = DAGate(base_feat * 2)
+            self.gate3 = DAGate(base_feat * 4)
 
         # --- Step 3: Decoding ---
         self.up3 = UpsampleBlock(base_feat * 8, base_feat * 4)
@@ -153,12 +177,10 @@ class DAGatedAE(nn.Module):
 
         self.final_conv = nn.Conv2d(base_feat, out_channels, kernel_size=1)
 
-    def _make_dsc_layer(self, in_ch, out_ch):
-        """算法要求每个 level 包含 DSC 块"""
-        # 按照论文通常实践，每个 Level 包含两层卷积以增加深度
+    def _make_layer(self, in_ch, out_ch):
         return nn.Sequential(
-            DSCBlock(in_ch, out_ch),
-            DSCBlock(out_ch, out_ch)
+            self.Block(in_ch, out_ch),
+            self.Block(out_ch, out_ch)
         )
 
     def forward(self, x):
@@ -173,17 +195,17 @@ class DAGatedAE(nn.Module):
 
         # Step 2 & 3: Gating & Decoding
         # Level 3
-        g3 = self.gate3(e3)
+        g3 = self.gate3(e3) if self.use_gate else e3
         u3 = self.up3(b)
         d3 = self.dec3(torch.cat([u3, g3], 1))
 
         # Level 2
-        g2 = self.gate2(e2)
+        g2 = self.gate2(e2) if self.use_gate else e2
         u2 = self.up2(d3)
         d2 = self.dec2(torch.cat([u2, g2], 1))
 
         # Level 1
-        g1 = self.gate1(e1)
+        g1 = self.gate1(e1) if self.use_gate else e1
         u1 = self.up1(d2)
         d1 = self.dec1(torch.cat([u1, g1], 1))
 

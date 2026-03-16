@@ -72,7 +72,13 @@ def get_model(model_name: str, **kwargs):
     elif name_lower == "da_gated_ae":
         # 我们的模型使用轻量化配置
         defaults['base_feat'] = 32
+        # ✅ 新增：消融实验默认开关 (默认为论文最终提出的 Full Model)
+        defaults['use_gate'] = True
+        defaults['use_dsc'] = True
 
+    # 这里的 final_params 会将 defaults 和传入的 kwargs 合并
+    # 如果 kwargs 里有 use_gate=False，它会覆盖掉 defaults 里的 True
+    # 完美适配消融实验
     final_params = {**defaults, **kwargs}
 
     # 4. 实例化模型

@@ -2,13 +2,11 @@
 Module: Training Script - DA-Gated AE (Proposed Method)
 Description:
     该脚本实现了 DA-Gated AE 的静态数据集训练流程，以确保与 Baseline 模型在相同噪声样本下进行公平对比。
-    保留了核心的 Hybrid Loss 和基于验证集 PSNR 的模型选择策略。
 """
 
 import os
 import sys
 import torch
-import numpy as np
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -52,25 +50,6 @@ def validate(model, val_loader):
             count += 1
     
     return total_loss / count
-
-# 原始PSNR验证函数（已注释，保留用于对比分析）
-# def validate_psnr(model, val_loader):
-#     """验证集评估逻辑：计算平均 PSNR"""
-#     model.eval()
-#     psnr_list = []
-#     with torch.no_grad():
-#         for noisy, clean in val_loader:
-#             noisy, clean = noisy.to(DEVICE), clean.to(DEVICE)
-#             output = model(noisy)
-#
-#             # 转为 Numpy 计算指标
-#             clean_np = (clean.cpu().numpy() * 255).astype('uint8')
-#             output_np = (torch.clamp(output, 0, 1).cpu().numpy() * 255).astype('uint8')
-#
-#             for i in range(clean_np.shape[0]):
-#                 psnr = calculate_psnr(clean_np[i, 0], output_np[i, 0])
-#                 psnr_list.append(psnr)
-#     return np.mean(psnr_list)
 
 
 def train():
@@ -147,19 +126,6 @@ def train():
         logger.save_csv([{"epoch": epoch, "loss": avg_loss, "best_loss": best_loss}])
 
     print(f"✅ 训练圆满完成。最低 Loss: {best_loss:.5f}")
-
-# 原始PSNR保存逻辑（已注释，保留用于对比分析）
-# if epoch % 5 == 0:
-#     val_psnr = validate_psnr(model, val_loader)
-#     print(f"Epoch {epoch}: Loss={avg_loss:.5f} | Val PSNR={val_psnr:.2f}dB")
-#
-#     if val_psnr > best_psnr:
-#         best_psnr = val_psnr
-#         patience_count = 0
-#         torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, f"{MODEL_NAME}_best.pth"))
-#         print(f"⭐ 发现新高！权重已保存至 {MODEL_NAME}_best.pth")
-#     else:
-#         patience_count += 1
 
 
 if __name__ == "__main__":
