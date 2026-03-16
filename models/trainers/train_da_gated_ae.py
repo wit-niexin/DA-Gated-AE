@@ -29,6 +29,14 @@ LR = 1e-4
 WEIGHT_DECAY = 3e-4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_NAME = "da_gated_ae"
+# --- 手动配置消融实验参数 ---
+ablation_config = {
+    "use_gate": True,  # Model A 改为 False，Model B/C/D 改为 True
+    "use_dsc": True    # 保持 True
+}
+# --- 手动配置损失函数参数 ---
+l_rec, l_ssim, l_edge = 1.0, 0.5, 0.1 # Model D 权重
+
 CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, f"checkpoints/{MODEL_NAME}")
 RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -39,7 +47,7 @@ def validate(model, val_loader):
     model.eval()
     total_loss = 0
     count = 0
-    criterion = HybridLoss(lambda_rec=1.0, lambda_ssim=0.5, lambda_edge=0.1).to(DEVICE)
+    criterion = HybridLoss(lambda_rec=l_rec, lambda_ssim=l_ssim, lambda_edge=l_edge).to(DEVICE)
     
     with torch.no_grad():
         for noisy, clean in val_loader:
@@ -72,10 +80,10 @@ def train():
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
 
     # --- 3. 初始化 ---
-    model = get_model(MODEL_NAME).to(DEVICE)
+    model = get_model(MODEL_NAME, **ablation_config).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
-    criterion = HybridLoss(lambda_rec=1.0, lambda_ssim=0.5, lambda_edge=0.1).to(DEVICE)
+    criterion = HybridLoss(lambda_rec=l_rec, lambda_ssim=l_ssim, lambda_edge=l_edge).to(DEVICE)
     logger = ExperimentLogger(model_name=MODEL_NAME, root_dir=RESULTS_DIR)
 
     best_loss = float('inf')  # 改为基于loss保存（越小越好）
