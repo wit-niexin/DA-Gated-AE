@@ -35,7 +35,7 @@ ablation_config = {
     "use_dsc": True    # 保持 True
 }
 # --- 手动配置损失函数参数 ---
-l_rec, l_ssim, l_edge = 1.0, 0.5, 0.1 # Model D 权重
+l_rec, l_ssim, l_edge = 1.0, 0.5, 0.1 # 默认为 Model D 权重，消融实验时需要手动修改
 
 CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, f"checkpoints/{MODEL_NAME}")
 RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
